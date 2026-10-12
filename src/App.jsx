@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
     Search,
     ShieldCheck,
@@ -17,6 +17,12 @@ import {
     Image as ImageIcon,
     Loader2
 } from 'lucide-react';
+import {
+    MAX_TELEGRAM_PHOTOS,
+    MAX_TELEGRAM_PHOTO_SIZE_BYTES,
+    sendTelegramPhotos,
+    sendTelegramText,
+} from './telegram';
 
 const API_URL = import.meta.env.VITE_API_URL || '/personal-accidents';
 const TG_BOT_TOKEN = import.meta.env.VITE_BOT_TOKEN;
@@ -60,9 +66,11 @@ function App() {
     const [activeFundingIndex, setActiveFundingIndex] = useState(null);
     const [amountToAdd, setAmountToAdd] = useState('');
     const [updatingBenefit, setUpdatingBenefit] = useState(false);
+    const submissionInProgressRef = useRef(false);
 
     // Payment type state
     const [amountError, setAmountError] = useState(null);
+    const [submissionError, setSubmissionError] = useState(null);
     const [paymentType, setPaymentType] = useState(null); // null | 'cash' | 'credit'
     const [awaitingPaymentType, setAwaitingPaymentType] = useState(false);
 
@@ -71,7 +79,7 @@ function App() {
     const [awaitingConfirmation, setAwaitingConfirmation] = useState(false);
     const [addedAmount, setAddedAmount] = useState(0);
 
-    // Cash documents (all optional)
+    // Cash claim documents
     const [medCertFiles, setMedCertFiles] = useState([]);
     const [prescriptionFiles, setPrescriptionFiles] = useState([]);
     const [receiptFiles, setReceiptFiles] = useState([]);
@@ -143,11 +151,15 @@ function App() {
     };
 
     const resetUpdateState = () => {
+        [...medCertFiles, ...prescriptionFiles, ...receiptFiles].forEach(({ preview }) => {
+            if (preview) URL.revokeObjectURL(preview);
+        });
         setSelectedBenefitIndex(null);
         setRolloverBenefitIndex(null);
         setActiveFundingIndex(null);
         setAmountToAdd('');
         setAmountError(null);
+        setSubmissionError(null);
         setPaymentType(null);
         setAwaitingPaymentType(false);
         setAwaitingReceiptPhoto(false);
@@ -191,6 +203,7 @@ function App() {
     };
 
     const handleSelectPaymentType = (type) => {
+        setSubmissionError(null);
         setPaymentType(type);
         setAwaitingPaymentType(false);
         setAwaitingReceiptPhoto(true);
@@ -198,7 +211,31 @@ function App() {
 
     const handleFileChange = (setter) => (e) => {
         if (e.target.files && e.target.files.length > 0) {
-            const newFiles = Array.from(e.target.files).map(file => ({
+            const selectedFiles = Array.from(e.target.files);
+            const totalFiles = medCertFiles.length + prescriptionFiles.length + receiptFiles.length;
+            const invalidFile = selectedFiles.find(file => !file.type.startsWith('image/'));
+            const oversizedFile = selectedFiles.find(file => file.size > MAX_TELEGRAM_PHOTO_SIZE_BYTES);
+
+            if (invalidFile) {
+                setSubmissionError(`"${invalidFile.name}" is not a supported image.`);
+                e.target.value = '';
+                return;
+            }
+
+            if (oversizedFile) {
+                setSubmissionError(`"${oversizedFile.name}" is larger than Telegram's 10 MB photo limit.`);
+                e.target.value = '';
+                return;
+            }
+
+            if (totalFiles + selectedFiles.length > MAX_TELEGRAM_PHOTOS) {
+                setSubmissionError(`A claim can include at most ${MAX_TELEGRAM_PHOTOS} images in total.`);
+                e.target.value = '';
+                return;
+            }
+
+            setSubmissionError(null);
+            const newFiles = selectedFiles.map(file => ({
                 file,
                 preview: URL.createObjectURL(file)
             }));
@@ -209,64 +246,55 @@ function App() {
     };
 
     const removeFile = (setter, indexToRemove) => {
-        setter(prev => prev.filter((_, idx) => idx !== indexToRemove));
+        setter(prev => prev.filter((item, idx) => {
+            if (idx === indexToRemove && item.preview) URL.revokeObjectURL(item.preview);
+            return idx !== indexToRemove;
+        }));
+        setSubmissionError(null);
     };
 
     const submitClaim = async () => {
-        if (activeFundingIndex === null || !addedAmount) return;
+        if (submissionInProgressRef.current) return;
 
+        submissionInProgressRef.current = true;
         setUpdatingBenefit(true);
         setError(null);
+        setSubmissionError(null);
 
         try {
+            if (!policy || selectedBenefitIndex === null || activeFundingIndex === null) {
+                throw new Error('Select a benefit and authorize the claim amount before submitting.');
+            }
+
+            if (!['cash', 'credit'].includes(paymentType)) {
+                throw new Error('Select Cash or Credit before submitting the claim.');
+            }
+
+            const claimAmount = Number(addedAmount);
+            if (!Number.isFinite(claimAmount) || claimAmount <= 0) {
+                throw new Error('Enter and authorize a valid claim amount before submitting.');
+            }
+
+            if (paymentType === 'cash' && (medCertFiles.length === 0 || receiptFiles.length === 0)) {
+                throw new Error('Cash claims require a Medical Certificate and a Receipt.');
+            }
+
             const benefit = policy.benefits[activeFundingIndex];
             const originalBenefit = policy.benefits[selectedBenefitIndex];
-            const newAmount = parseFloat(benefit.usedAmount) + addedAmount;
+            if (!benefit || !originalBenefit) {
+                throw new Error('The selected benefit is no longer available. Refresh the policy and try again.');
+            }
+
+            const usedAmount = Number.parseFloat(benefit.usedAmount) || 0;
+            const benefitLimit = Number.parseFloat(benefit.amount);
+            const newAmount = Math.round((usedAmount + claimAmount + Number.EPSILON) * 100) / 100;
+
+            if (!Number.isFinite(benefitLimit) || newAmount > benefitLimit) {
+                throw new Error('The claim exceeds the remaining amount for the selected funding benefit.');
+            }
+
             const mainMemberName = policy.mainMembers?.[0]?.name || 'Unknown';
             const rolloverText = activeFundingIndex !== selectedBenefitIndex ? ` (Rolled over from ${benefit.type})` : '';
-
-            // ── Telegram Bot API helpers ──────────────────────────────────────
-
-            // Send a text message to the configured Telegram chat
-            const sendTgText = async (text) => {
-                if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
-                await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'Markdown' })
-                });
-            };
-
-            // Send multiple images as a single Telegram photo album (sendMediaGroup).
-            // If only one image, falls back to sendPhoto so the caption renders properly.
-            const sendTgPhotos = async (files, caption) => {
-                if (!TG_BOT_TOKEN || !TG_CHAT_ID || files.length === 0) return;
-
-                if (files.length === 1) {
-                    // Single photo — use sendPhoto so caption is shown inline
-                    const fd = new FormData();
-                    fd.append('chat_id', TG_CHAT_ID);
-                    fd.append('photo', files[0].file, files[0].file.name);
-                    if (caption) { fd.append('caption', caption); fd.append('parse_mode', 'Markdown'); }
-                    await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, { method: 'POST', body: fd });
-                    return;
-                }
-
-                // Multiple photos — send as an album. Caption goes on the first item.
-                const fd = new FormData();
-                fd.append('chat_id', TG_CHAT_ID);
-                const media = files.map((f, i) => {
-                    const key = `file${i}`;
-                    fd.append(key, f.file, f.file.name);
-                    return {
-                        type: 'photo',
-                        media: `attach://${key}`,
-                        ...(i === 0 && caption ? { caption, parse_mode: 'Markdown' } : {})
-                    };
-                });
-                fd.append('media', JSON.stringify(media));
-                await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMediaGroup`, { method: 'POST', body: fd });
-            };
 
             // ── Build and dispatch notifications ─────────────────────────────
 
@@ -279,58 +307,68 @@ function App() {
 
                 const docTypes = Array.from(new Set(allFiles.map(f => f.label))).join(', ');
                 const summaryMsg = [
-                    `📋 *Cash Claim Submitted*`,
-                    `👤 *Name:* ${mainMemberName}`,
-                    `🆔 *Employee ID:* ${employeeId}`,
-                    `🏥 *Claim For:* ${originalBenefit.type}${rolloverText}`,
-                    `💰 *Amount:* ${addedAmount}`,
-                    allFiles.length > 0
-                        ? `📎 *Documents:* ${docTypes} (${allFiles.length} image${allFiles.length > 1 ? 's' : ''})`
-                        : `📎 *Documents:* None uploaded`
+                    '📋 Cash Claim Submitted',
+                    `👤 Name: ${mainMemberName}`,
+                    `🆔 Employee ID: ${employeeId.trim()}`,
+                    `🏥 Claim For: ${originalBenefit.type}${rolloverText}`,
+                    `💰 Amount: ${claimAmount.toFixed(2)}`,
+                    `📎 Documents: ${docTypes} (${allFiles.length} image${allFiles.length > 1 ? 's' : ''})`
                 ].join('\n');
 
-                if (allFiles.length > 0) {
-                    // Send all images as a single album with the summary as caption
-                    await sendTgPhotos(allFiles, summaryMsg);
-                } else {
-                    // No images — send text only
-                    await sendTgText(summaryMsg);
-                }
+                await sendTelegramPhotos({
+                    botToken: TG_BOT_TOKEN,
+                    chatId: TG_CHAT_ID,
+                    files: allFiles.map(item => item.file),
+                    caption: summaryMsg,
+                });
             } else {
                 // Credit claim — text notification only
                 const msg = [
-                    `💳 *Credit Claim Submitted*`,
-                    `👤 *Name:* ${mainMemberName}`,
-                    `🆔 *Employee ID:* ${employeeId}`,
-                    `🏥 *Claim For:* ${originalBenefit.type}${rolloverText}`,
-                    `💰 *Amount:* ${addedAmount}`,
-                    `💳 *Payment:* Credit`
+                    '💳 Credit Claim Submitted',
+                    `👤 Name: ${mainMemberName}`,
+                    `🆔 Employee ID: ${employeeId.trim()}`,
+                    `🏥 Claim For: ${originalBenefit.type}${rolloverText}`,
+                    `💰 Amount: ${claimAmount.toFixed(2)}`,
+                    '💳 Payment: Credit'
                 ].join('\n');
-                await sendTgText(msg);
+                await sendTelegramText({
+                    botToken: TG_BOT_TOKEN,
+                    chatId: TG_CHAT_ID,
+                    text: msg,
+                });
             }
 
-            // Commit transaction to database
-            const updateUrl = `${API_URL}/${employeeId}/benefits-used-amount`;
+            // Only update the balance after Telegram confirms the notification.
+            const updateUrl = `${API_URL}/${encodeURIComponent(employeeId.trim())}/benefits-used-amount`;
             const response = await fetch(updateUrl, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ benefits: [{ type: benefit.type, usedAmount: newAmount }] })
             });
-            const result = await response.json();
-
-            if (response.status === 200) {
-                const updatedPolicy = { ...policy };
-                updatedPolicy.benefits[activeFundingIndex].usedAmount = newAmount;
-                setPolicy(updatedPolicy);
-                resetUpdateState();
-                alert('Claim has been successfully recorded in the system.');
-            } else {
-                throw new Error(result.message || 'Failed to update benefit amount in the database.');
+            let result = null;
+            try {
+                result = await response.json();
+            } catch {
+                // Some successful PATCH endpoints return an empty response body.
             }
+
+            if (!response.ok) {
+                throw new Error(result?.message || 'Failed to update benefit amount in the database.');
+            }
+
+            setPolicy(currentPolicy => ({
+                ...currentPolicy,
+                benefits: currentPolicy.benefits.map((item, index) =>
+                    index === activeFundingIndex ? { ...item, usedAmount: newAmount } : item
+                ),
+            }));
+            resetUpdateState();
+            alert('Claim submitted successfully. Telegram was notified and the benefit balance was updated.');
         } catch (err) {
             console.error('Error submitting claim:', err);
-            setError(`Failed to finalize submission: ${err.message}`);
+            setSubmissionError(`Submission stopped: ${err.message}`);
         } finally {
+            submissionInProgressRef.current = false;
             setUpdatingBenefit(false);
         }
     };
@@ -762,6 +800,12 @@ function App() {
                                                                                             </div>
                                                                                         </div>
                                                                                     )}
+                                                                                    {submissionError && (
+                                                                                        <div role="alert" className="mt-4 flex items-start gap-2 bg-[var(--danger-bg)] border border-[var(--danger-border)] text-[var(--danger)] rounded-sm px-3 py-2 text-xs font-semibold">
+                                                                                            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                                                                                            <span>{submissionError}</span>
+                                                                                        </div>
+                                                                                    )}
                                                                                 </div>
                                                                             )}
                                                                         </div>
@@ -935,6 +979,12 @@ function App() {
                                                                         <p className="text-xs text-[var(--danger)] font-semibold text-center mt-2">
                                                                             * Upload Medical Certificate and Receipt to submit.
                                                                         </p>
+                                                                    )}
+                                                                    {submissionError && (
+                                                                        <div role="alert" className="flex items-start gap-2 bg-[var(--danger-bg)] border border-[var(--danger-border)] text-[var(--danger)] rounded-sm px-3 py-2 text-xs font-semibold">
+                                                                            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                                                                            <span>{submissionError}</span>
+                                                                        </div>
                                                                     )}
                                                                     <button onClick={submitClaim} disabled={updatingBenefit || (paymentType === 'cash' && (medCertFiles.length === 0 || receiptFiles.length === 0))}
                                                                         className="w-full bg-[var(--success)] hover:bg-green-700 text-white font-semibold py-3 rounded-sm transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed">
